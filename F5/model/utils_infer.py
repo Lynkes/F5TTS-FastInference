@@ -8,10 +8,10 @@ import numpy as np
 import torch
 import torchaudio
 import tqdm
-from pydub import AudioSegment, silence
 from transformers import pipeline
 from vocos import Vocos
-
+import subprocess
+import os
 import hashlib
 
 from ..model import CFM
@@ -52,6 +52,27 @@ import sounddevice as sd
 audio_queue = queue.Queue()
 
 playback_thread = None  # Variável global para controlar a thread de reprodução
+
+# Exemplo da função de remoção de silêncio com ffmpeg
+def remove_silence_ffmpeg(input_path: str, output_path: str, threshold: float = -50.0, duration: float = 1.0):
+    """
+    Remove silence from an audio file using ffmpeg's silenceremove filter.
+
+    Parameters:
+        input_path (str): Path to the input audio file.
+        output_path (str): Path to save the processed audio.
+        threshold (float): Silence threshold in dB (default: -50dB).
+        duration (float): Minimum silence duration to trim (default: 1.0 seconds).
+    """
+    cmd = [
+        'ffmpeg',
+        '-y',
+        '-i', input_path,
+        '-af', f'silenceremove=start_periods=1:start_duration={duration}:start_threshold={threshold}dB:'
+               f'stop_periods=1:stop_duration={duration}:stop_threshold={threshold}dB',
+        output_path
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 def play_audio_continuous():
     """Reproduz segmentos de áudio da fila continuamente, concatenando-os para evitar cortes."""
@@ -184,23 +205,35 @@ def load_model(model_cls, model_cfg, ckpt_path, vocab_file="", ode_method=ode_me
 # preprocess reference audio and text
 
 
+# Adaptado para usar ffmpeg
 def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print, device=device):
-    show_info("Converting audio...")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-        aseg = AudioSegment.from_file(ref_audio_orig)
+    show_info("Converting and processing audio...")
 
-        non_silent_segs = silence.split_on_silence(aseg, min_silence_len=1000, silence_thresh=-50, keep_silence=1000)
-        non_silent_wave = AudioSegment.silent(duration=0)
-        for non_silent_seg in non_silent_segs:
-            non_silent_wave += non_silent_seg
-        aseg = non_silent_wave
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_output:
+        cleaned_audio_path = temp_output.name
 
-        audio_duration = len(aseg)
-        if audio_duration > 15000:
-            show_info("Audio is over 15s, clipping to only first 15s.")
-            aseg = aseg[:15000]
-        aseg.export(f.name, format="wav")
-        ref_audio = f.name
+    try:
+        # Remove silence com ffmpeg
+        remove_silence_ffmpeg(ref_audio_orig, cleaned_audio_path, threshold=-50.0, duration=1.0)
+    except subprocess.CalledProcessError:
+        show_info("Failed to process audio with ffmpeg. Falling back to original.")
+        cleaned_audio_path = ref_audio_orig
+
+    # Limita duração a 15s com ffmpeg
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as clipped_audio_file:
+        clipped_path = clipped_audio_file.name
+    try:
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', cleaned_audio_path,
+            '-t', '15',
+            clipped_path
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except subprocess.CalledProcessError:
+        show_info("Failed to clip audio. Using untrimmed version.")
+        clipped_path = cleaned_audio_path
+
+    ref_audio = clipped_path
 
     # Compute a hash of the reference audio file
     with open(ref_audio, "rb") as audio_file:
@@ -209,7 +242,6 @@ def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print, device=
 
     global _ref_audio_cache
     if audio_hash in _ref_audio_cache:
-        # Use cached reference text
         show_info("Using cached reference text...")
         ref_text = _ref_audio_cache[audio_hash]
     else:
@@ -228,10 +260,9 @@ def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print, device=
             show_info("Finished transcription")
         else:
             show_info("Using custom reference text...")
-        # Cache the transcribed text
+
         _ref_audio_cache[audio_hash] = ref_text
 
-    # Ensure ref_text ends with a proper sentence-ending punctuation
     if not ref_text.endswith(". ") and not ref_text.endswith("。"):
         if ref_text.endswith("."):
             ref_text += " "
@@ -323,7 +354,7 @@ def infer_batch_process(
 
     if len(ref_text[-1].encode("utf-8")) == 1:
         ref_text = ref_text + " "
-    for i, gen_text in enumerate(progress.tqdm(gen_text_batches)):
+    for i, gen_text in enumerate(progress(gen_text_batches)):
         # Prepara o texto
         text_list = [ref_text + gen_text]
         final_text_list = convert_char_to_pinyin(text_list)
@@ -406,11 +437,30 @@ def infer_batch_process(
 # remove silence from generated wav
 
 
-def remove_silence_for_generated_wav(filename):
-    aseg = AudioSegment.from_file(filename)
-    non_silent_segs = silence.split_on_silence(aseg, min_silence_len=1000, silence_thresh=-50, keep_silence=500)
-    non_silent_wave = AudioSegment.silent(duration=0)
-    for non_silent_seg in non_silent_segs:
-        non_silent_wave += non_silent_seg
-    aseg = non_silent_wave
-    aseg.export(filename, format="wav")
+def remove_silence_for_generated_wav(filename: str, threshold: float = -50.0, duration: float = 1.0):
+    """
+    Removes silence from the given WAV file using ffmpeg and overwrites the original file.
+
+    Parameters:
+        filename (str): Path to the WAV file to process.
+        threshold (float): Silence threshold in dBFS.
+        duration (float): Minimum silence duration to remove in seconds.
+    """
+    temp_output = filename + ".nosil.wav"
+
+    try:
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", filename,
+            "-af", f"silenceremove=start_periods=1:start_duration={duration}:start_threshold={threshold}dB:"
+                   f"stop_periods=1:stop_duration={duration}:stop_threshold={threshold}dB",
+            temp_output
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+        # Replace original file with processed one
+        os.replace(temp_output, filename)
+
+    except subprocess.CalledProcessError as e:
+        print(f"FFmpeg failed to process audio: {e}")
+        if os.path.exists(temp_output):
+            os.remove(temp_output)
