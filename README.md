@@ -9,8 +9,8 @@
 ### 1. Clone the repository
 
 ```bash
-git clone [<your-repo-url>](https://github.com/Lynkes/F5TTS-FastInference.git)
-cd <F5TTS-FastInference>
+git clone https://github.com/Lynkes/F5TTS-FastInference.git
+cd F5TTS-FastInference
 ```
 
 ### 2. Create and activate a virtual environment
