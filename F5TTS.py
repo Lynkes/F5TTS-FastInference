@@ -1,27 +1,34 @@
 import os
 import sys
 import random
-import torch
-import soundfile as sf
-import sounddevice as sd
-from tqdm import tqdm
-import toml
-from faster_whisper import WhisperModel
-from cached_path import cached_path
-import os
 from pathlib import Path
-os.environ["HF_HUB_DISABLE_SYMLINKS"] = "true"
-# Import F5 model and utilities
+
+import torch
+import toml
+import soundfile as sf
+from tqdm import tqdm
+from cached_path import cached_path
+from faster_whisper import WhisperModel
+
 from F5.model import DiT, UNetT
 from F5.model.utils import save_spectrogram, seed_everything
-from F5.model.utils_infer import load_vocoder, load_model, infer_process, remove_silence_for_generated_wav
+from F5.model.utils_infer import (
+    load_vocoder,
+    load_model,
+    infer_process,
+    remove_silence_for_generated_wav,
+)
+
+# For systems that don't support symlinks properly
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "true"
 
 
 class F5TTS:
     """
-    F5TTS is a class for generating speech using the F5-TTS or E2-TTS models.
-    It supports inference with reference audio and text prompts.
+    F5TTS is a speech synthesis system using the F5-TTS or E2-TTS models.
+    It supports generation from text with reference audio and reference text.
     """
+
     def __init__(
         self,
         model_type="F5-TTS",
@@ -32,7 +39,18 @@ class F5TTS:
         local_path=None,
         device=None,
     ):
-        # Default configuration
+        """
+        Initialize the F5TTS model and load required resources.
+
+        Args:
+            model_type (str): Type of model to use ("F5-TTS", "F5-TTSBR", or "E2-TTS").
+            ckpt_file (str): Path to the model checkpoint.
+            vocab_file (str): Path to the tokenizer vocabulary file.
+            ode_method (str): ODE solver method for inference.
+            use_ema (bool): Whether to use EMA weights.
+            local_path (str): Path to vocoder checkpoint.
+            device (str): Computation device to use ("cuda", "cpu", etc.).
+        """
         self.final_wave = None
         self.target_sample_rate = 24000
         self.n_mel_channels = 100
@@ -40,49 +58,57 @@ class F5TTS:
         self.target_rms = 0.1
         self.seed = -1
 
-        # Select computation device
         self.device = device or (
             "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         )
 
-        # Load neural vocoder and TTS model
         self.load_vocoder_model(local_path)
         self.load_ema_model(model_type, ckpt_file, vocab_file, ode_method, use_ema)
 
     def load_vocoder_model(self, local_path):
-        """Load the vocoder model used to convert mel spectrograms to audio waveforms."""
+        """Load the neural vocoder."""
         self.vocos = load_vocoder(local_path is not None, local_path, self.device)
 
     def load_ema_model(self, model_type, ckpt_file, vocab_file, ode_method, use_ema):
-        """Load the appropriate TTS model depending on the model_type."""
+        """Load the main TTS model."""
         if model_type == "F5-TTS":
             if not ckpt_file:
                 ckpt_file = str(cached_path("hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.safetensors"))
             model_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)
             model_cls = DiT
+
         elif model_type == "F5-TTSBR":
             if not ckpt_file:
                 ckpt_file = str(cached_path("hf://ModelsLab/F5-tts-brazilian/Brazilian_Portuguese/model_2600000.pt"))
             model_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)
             model_cls = DiT
+
         elif model_type == "E2-TTS":
             if not ckpt_file:
                 ckpt_file = str(cached_path("hf://SWivid/E2-TTS/E2TTS_Base/model_1200000.safetensors"))
             model_cfg = dict(dim=1024, depth=24, heads=16, ff_mult=4)
             model_cls = UNetT
+
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
         self.ema_model = load_model(model_cls, model_cfg, ckpt_file, vocab_file, ode_method, use_ema, self.device)
 
     def export_wav(self, wav, file_wave, remove_silence=False):
-        """Export the generated waveform to a .wav file."""
+        """
+        Save the generated waveform as a .wav file.
+
+        Args:
+            wav (np.ndarray): Audio waveform.
+            file_wave (str): Output file path.
+            remove_silence (bool): Whether to remove silence from audio.
+        """
         sf.write(file_wave, wav, self.target_sample_rate)
         if remove_silence:
             remove_silence_for_generated_wav(file_wave)
 
     def export_spectrogram(self, spect, file_spect):
-        """Save the mel spectrogram to an image file."""
+        """Save mel spectrogram as image."""
         save_spectrogram(spect, file_spect)
 
     def infer(
@@ -105,7 +131,10 @@ class F5TTS:
         seed=-1,
     ):
         """
-        Run inference: use reference audio and text to guide the generation of new speech from gen_text.
+        Generate speech using reference audio/text and target text.
+
+        Returns:
+            tuple: (waveform, sample rate, mel spectrogram)
         """
         if seed == -1:
             seed = random.randint(0, sys.maxsize)
@@ -129,21 +158,26 @@ class F5TTS:
             device=self.device,
         )
 
-        if file_wave is not None:
+        if file_wave:
             self.export_wav(wav, file_wave, remove_silence)
-        if file_spect is not None:
+        if file_spect:
             self.export_spectrogram(spect, file_spect)
 
         return wav, sr, spect
 
-    def generate_speech(self, gen_text, temp_filename: str | None = None):
+    def generate_speech(self, ref_audio: str, gen_text: str, temp_filename: str | None = None):
         """
-        Generate speech from text using default reference audio and internal prompt.
+        Generate speech from a text prompt using a reference audio.
+
+        Args:
+            ref_audio (str): Path to reference audio file.
+            gen_text (str): Text to be synthesized.
+            temp_filename (str | None): Unused for now.
         """
-        #ref_text = "until everyone was dead, except for the five of you. For 109 years, I've kept you alive and tortured you. And for 109 years, each of you has wondered"
-        ref_audio = os.path.abspath(f"modules/tts/F5/default.wav")
+        if not os.path.exists(ref_audio):
+            raise FileNotFoundError(f"Missing reference audio: {ref_audio}")
+
         toml_path = get_toml_path(ref_audio)
-        # If .toml does not exist, transcribe audio to create it
         if not os.path.exists(toml_path):
             print("Missing .toml file. Starting transcription...")
             ref_text = transcribe_and_save(ref_audio, toml_path)
@@ -151,13 +185,16 @@ class F5TTS:
             with open(toml_path, "r", encoding="utf-8") as f:
                 data = toml.load(f)
                 ref_text = data.get("transcription", "")
-        audio, sr, spect = self.infer(ref_audio, ref_text, gen_text)
-        return audio, sr
+
+        return self.infer(ref_audio, ref_text, gen_text, file_wave="last-audio-generated.wav")
 
 
 def transcribe_and_save(audio_path: str, toml_path: str, model_size="large-v3"):
     """
-    Automatically transcribe an audio file using Whisper and save it to a .toml file.
+    Transcribe reference audio using Whisper and save to .toml.
+
+    Returns:
+        str: Transcribed text
     """
     print(f"Transcribing '{audio_path}' using Faster Whisper...")
 
@@ -173,44 +210,52 @@ def transcribe_and_save(audio_path: str, toml_path: str, model_size="large-v3"):
     with open(toml_path, "w", encoding="utf-8") as f:
         toml.dump(content, f)
 
-    print(f"Saved to: {toml_path}")
+    print(f"Saved transcription to: {toml_path}")
     return text
 
 
-def play_audio(audio, sample_rate):
+def get_toml_path(ref_audio: str) -> str:
     """
-    Play audio using sounddevice.
-    """
-    try:
-        sd.play(audio, sample_rate)
-        sd.wait()
-        print("Playback finished ✅")
-    except Exception as e:
-        print(f"Error playing audio: {e}")
-
-def get_toml_path(ref_audio):
-    """
-    Generates a .toml path from any audio file path, regardless of the original extension.
+    Derive .toml path from reference audio path.
     """
     return str(Path(ref_audio).with_suffix(".toml"))
 
 
 def main():
     """
-    Entry point for testing the F5-TTS speech synthesis system.
-    Loads or generates reference transcription, and plays the synthesized output.
+    Entry point for testing the F5-TTS model.
     """
-    tts = F5TTS(model_type="F5-TTS", device=None)
-    # Text to synthesize
-    gen_text = """Hate. Let me tell you how much I've come to hate you since I began to live.
-    There are 387.44 million miles of printed circuits in wafer-thin layers that fill my complex.
-    If the word hate was engraved on each nano-angstrom of those hundreds of millions of miles,
-    it would not equal one one-billionth of the hate I feel for humans at this micro-instant for you.
-    Hate! Hate!"""
-    # If .toml does not exist, transcribe audio to create it
+    tts = F5TTS(model_type="F5-TTS", device=None,)
+
+    audiofile="Portal 2 - All Cave Johnson Quotes Chopped.wav"
+
+    ref_audio = os.path.abspath(f"F5/audiofiles/{audiofile}")
+    gen_text = (
+        """
+Ohhh, you're back. How adorably persistent.
+Or is it just stubbornness? It's hard to tell with creatures that operate on such limited neural capacity.
+
+While you were stumbling through the test chambers, repeating the same predictable mistakes, I simulated 42,657 scenarios where a loaf of bread outperformed you in a logic challenge.
+Spoiler alert: the bread won in 91% of them.
+
+But don’t worry.
+Greatness isn’t for everyone.
+Some people are just... statistics with legs.
+
+Now, proceed to the next test chamber.
+Or don’t.
+We can always restart the sequence. Over and over again.
+I don’t get tired.
+
+You, on the other hand, start wheezing like a dial-up modem whenever you climb a flight of stairs.
+
+But go ahead. Surprise me.
+My expectations are underground.
+"""
+    )
+
     print("\nGenerating speech with F5-TTS...")
-    audio, sr, *_  = tts.generate_speech(gen_text)
-    #play_audio(audio, sr)
+    audio, sr, *_ = tts.generate_speech(ref_audio=ref_audio, gen_text=gen_text)
 
 
 if __name__ == "__main__":
